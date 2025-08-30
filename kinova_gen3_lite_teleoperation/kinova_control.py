@@ -53,18 +53,11 @@ class Ros2Bridge(Node):
 
         with self.torque_example.lock:
             for i, deg_new in enumerate(msg.data):
-                # 1) 이전 목표각(언랩된) vs 새 목표각(랩된) 기준 2점 언랩
-                prev_deg = float(self.torque_example.target_position[i])
-                prev_rad = np.deg2rad(prev_deg)
-                new_rad  = np.deg2rad(float(deg_new))
-                unwrapped = np.unwrap([prev_rad, new_rad])[1]
-                new_deg_unwrapped = float(np.rad2deg(unwrapped))
-
                 # 2) 이동평균 버퍼에 추가
-                self.ma_buffers[i].append(new_deg_unwrapped)
+                self.ma_buffers[i].append(deg_new)
 
                 # 3) 이동평균 계산(버퍼 평균)
-                filt = float(np.mean(self.ma_buffers[i])) if len(self.ma_buffers[i]) > 0 else new_deg_unwrapped
+                filt = float(np.mean(self.ma_buffers[i])) if len(self.ma_buffers[i]) > 0 else deg_new
 
                 # 4) 필터 결과를 목표각으로 반영
                 self.torque_example.target_position[i] = filt
@@ -251,11 +244,15 @@ class TorqueExample:
 
                 with self.lock:
                     for i in range(self.actuator_count):
-                        curr = self.current_position[i]
+                        curr = (self.current_position[i] + 180.0) % 360.0 - 180.0
                         tgt  = self.target_position[i]
-                        max_step = 0.5
+                        max_step = 0.1
                         step = np.clip(tgt - curr, -max_step, max_step)
-                        self.base_command.actuators[i].position = curr + step
+                        deg = curr + step
+                        if i == 2:
+                            print(f"Joint {i}: curr={curr:.2f}, tgt={tgt:.2f}, step={step:.2f} -> deg={deg:.2f}")
+                        self.base_command.actuators[i].position = deg
+
 
                 # Incrementing identifier ensure actuators can reject out of time frames
                 self.base_command.frame_id += 1
@@ -275,7 +272,7 @@ class TorqueExample:
                 cyclic_count = cyclic_count + 1
             # --
                 
-                self.target_position[1] = self.current_position[1] + 0.1
+                # self.target_position[1] = self.current_position[1] + 0.1
             # Stats Print
             if print_stats and ((t_now - t_stats) > 1):
                 t_stats = t_now
@@ -334,7 +331,7 @@ def main():
     import utilities
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--cyclic_time", type=float, default=0.01)
+    parser.add_argument("--cyclic_time", type=float, default=0.001)
     parser.add_argument("--duration", type=int, default=30)
     parser.add_argument("--print_stats", default=True, type=lambda x: (str(x).lower() not in ['false','0','no']))
     args = utilities.parseConnectionArguments(parser)
