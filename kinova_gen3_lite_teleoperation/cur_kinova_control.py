@@ -19,10 +19,22 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray
 
+# Pinocchio for dynamics
+import pinocchio as pin
+
+# ==========================
+# Helper conversions
+# ==========================
+DEG2RAD = np.pi / 180.0
+RAD2DEG = 180.0 / np.pi
+
+def clamp(v, lo, hi):
+    return lo if v < lo else (hi if v > hi else v)
+
 class Ros2Bridge(Node):
-    def __init__(self, torque_example):
+    def __init__(self, current_control_example):
         super().__init__('ros2_bridge')
-        self.torque_example = torque_example
+        self.current_control_example = current_control_example
 
         # /target_position subscriber
         self.sub = self.create_subscription(
@@ -34,7 +46,7 @@ class Ros2Bridge(Node):
 
         self.ma_window = 30
         self.ma_buffers = [deque(maxlen=self.ma_window) 
-                           for _ in range(len(self.torque_example.target_position))]
+                           for _ in range(len(self.current_control_example.q_des_deg))]
 
         # /current_position publisher
         self.pub = self.create_publisher(Float32MultiArray, '/current_position', 10)
@@ -47,12 +59,12 @@ class Ros2Bridge(Node):
         if len(msg.data) != 7:
             self.get_logger().warning(
                 f"Received target length {len(msg.data)} != actuator count "
-                f"{len(self.torque_example.target_position)}"
+                f"{len(self.current_control_example.q_des_deg)}"
             )
             return
 
-        with self.torque_example.lock:
-            self.torque_example.target_gripper = msg.data[-1]  # 그리퍼 목표각 바로 반영
+        with self.current_control_example.lock:
+            self.current_control_example.target_gripper = msg.data[-1]  # 그리퍼 목표각 바로 반영
             for i, deg_new in enumerate(msg.data[:-1]):
                 # 2) 이동평균 버퍼에 추가
                 self.ma_buffers[i].append(deg_new)
@@ -61,27 +73,27 @@ class Ros2Bridge(Node):
                 filt = float(np.mean(self.ma_buffers[i])) if len(self.ma_buffers[i]) > 0 else deg_new
 
                 # 4) 필터 결과를 목표각으로 반영
-                self.torque_example.target_position[i] = filt
+                self.current_control_example.q_des_deg[i] = filt
 
         # self.get_logger().info("Updated target position (moving-average filtered).")
 
     def publish_current_position(self):
-        """TorqueExample에서 current_position 가져와 ROS2로 publish"""
+        """CurrentControlExample에서 current_position 가져와 ROS2로 publish"""
         msg = Float32MultiArray()
         processed_data = []
-        with self.torque_example.lock:
-            curr = list(self.torque_example.current_position)
+        with self.current_control_example.lock:
+            curr = list(self.current_control_example.q_deg)
         for i in range(len(curr)):
             angle_deg = float(curr[i])
             processed_data.append((angle_deg + 180.0) % 360.0 - 180.0)
 
-        processed_data.append(self.torque_example.current_gripper)
+        processed_data.append(self.current_control_example.current_gripper)
 
         msg.data = processed_data
         self.pub.publish(msg)
 
 
-class TorqueExample:
+class CurrentControlExample:
     def __init__(self, router, router_real_time):
         self.lock = threading.Lock()
         # Maximum allowed waiting time during actions (in seconds)
@@ -100,11 +112,11 @@ class TorqueExample:
 
         # Detect all devices
         device_handles = device_manager.ReadAllDevices()
-        self.actuator_count = self.base.GetActuatorCount().count
+        self.ndof = self.base.GetActuatorCount().count
 
         self.base_command.ClearField("actuators")
         self.base_feedback.ClearField("actuators")
-        for _ in range(self.actuator_count):
+        for _ in range(self.ndof):
             self.base_command.actuators.add()
             self.base_feedback.actuators.add()
 
@@ -127,13 +139,49 @@ class TorqueExample:
         self.already_stopped = False
         self.cyclic_running = False
 
-        self.current_position = [0.0] * self.actuator_count
-        self.target_position = [0.0] * self.actuator_count
+        # State buffers (deg, deg/s)
+        self.q_deg = [0.0]*self.ndof
+        self.dq_deg = [0.0]*self.ndof
+        self.q_des_deg = [0.0]*self.ndof
 
+        # Gripper percent (0~100)
         self.current_gripper = 0.0
         self.target_gripper = 0.0
-        self.grip_vel    = 30.0    # 0~100 (%)
-        self.grip_force  = 50.0    # 0~100 (%)
+        self.grip_vel = 30.0   # 0~100 (%/s)
+        self.grip_force = 50.0 # 0~100 (%)
+
+        # Pinocchio model
+        urdf_path = os.path.join(
+            os.path.dirname(__file__),
+            "GEN3-LITE.urdf"
+        )
+        print(f"[INFO] Loading URDF: {urdf_path}")
+        self.pin_model = pin.buildModelFromUrdf(urdf_path)
+        self.pin_data = self.pin_model.createData()
+
+        # PD gains in joint space (rad units)
+        self.Kp = np.array([40.0]*self.ndof)  # conservative start
+        self.Kd = np.array([2.0]*self.ndof)
+
+        # Soft torque limits (Nm) — conservative defaults
+        self.torque_limit = np.array([2.5, 2.5, 2.0, 1.5, 1.2, 1.0][:self.ndof])
+
+        # === Motor-current mapping (per Kinova issue #165) ===
+        # tau = I * Kt * N * eta => I = tau / (Kt*N*eta)
+        Kt_full = np.array([0.0398, 0.0398, 0.0398, 0.0251, 0.0251, 0.0251]) # N·m/A
+        N_full = np.array([30.0, 100.0, 30.0, 23.0, 23.0, 23.0])
+        eta_full= np.array([0.90, 0.65, 0.90, 0.90, 0.90, 0.90])
+        self.Kt = Kt_full[:self.ndof]
+        self.N = N_full[:self.ndof]
+        self.eta = eta_full[:self.ndof]
+
+
+        # Derived current limits from torque limits (A)
+        self.current_limit = self.torque_limit / (self.Kt * self.N * self.eta)
+
+
+        # Cycle params
+        self.t_sample = 0.001 # 200 Hz default
 
     # Create closure to set an event after an END or an ABORT
     def check_for_end_or_abort(self, e):
@@ -208,11 +256,13 @@ class TorqueExample:
             self.base_feedback = base_feedback
 
             # Init command frame
-            for x in range(self.actuator_count):
+            for x in range(self.ndof):
                 self.base_command.actuators[x].flags = 1  # servoing
                 self.base_command.actuators[x].position = self.base_feedback.actuators[x].position
-                self.current_position[x] = self.base_feedback.actuators[x].position
-                self.target_position[x] = self.base_feedback.actuators[x].position
+                self.q_deg[x] = self.base_feedback.actuators[x].position
+                self.q_des_deg[x] = self.base_feedback.actuators[x].position
+                self.dq_deg[x] = self.base_feedback.actuators[x].velocity
+                self.base_command.actuators[x].torque_joint = self.base_feedback.actuators[x].torque
 
             # Set arm in LOW_LEVEL_SERVOING
             base_servo_mode = Base_pb2.ServoingModeInformation()
@@ -231,6 +281,12 @@ class TorqueExample:
             # Send first frame
             self.base_feedback = self.base_cyclic.Refresh(self.base_command, 0, self.sendOption)
 
+            for i in range(self.ndof):
+                control_mode_message = ActuatorConfig_pb2.ControlModeInformation()
+                control_mode_message.control_mode = ActuatorConfig_pb2.ControlMode.Value('CURRENT')
+                device_id = i + 1
+                self.SendCallWithRetry(self.actuator_config.SetControlMode, 3, control_mode_message, device_id)
+
             # Init cyclic thread
             self.cyclic_t_end = t_end
             self.cyclic_thread = threading.Thread(target=self.RunCyclic, args=(sampling_time_cyclic, print_stats))
@@ -242,6 +298,11 @@ class TorqueExample:
             print("InitCyclic: failed to communicate")
             return False
 
+    def _tau_to_current(self, tau_nm: np.ndarray) -> np.ndarray:
+        """Map desired joint torques (Nm) -> motor currents (A)."""
+        I = tau_nm / (self.Kt * self.N * self.eta)
+        return np.clip(I, -self.current_limit, self.current_limit)
+    
     def RunCyclic(self, t_sample, print_stats):
         self.cyclic_running = True
         print("Run Cyclic")
@@ -254,10 +315,11 @@ class TorqueExample:
         t_cyclic = t_now  # cyclic time
         t_stats = t_now  # print  time
         t_init = t_now  # init   time
-        ma_size = 50  # moving average size
-        ma_deque = [deque(maxlen=ma_size) for _ in range(self.actuator_count)]
+ 
+        ma_size = 50
+        ma_deque = [deque(maxlen=ma_size) for _ in range(self.ndof)]
 
-        print("Running torque control example for {} seconds".format(self.cyclic_t_end))
+        cmd_id = 1
 
         while not self.kill_the_thread:
             t_now = time.time()
@@ -268,27 +330,38 @@ class TorqueExample:
                 t_cyclic = t_now
 
                 with self.lock:
-                    deg_list = []
-                    for i in range(self.actuator_count):
-                        curr = (self.current_position[i] + 180.0) % 360.0 - 180.0
-                        tgt  = self.target_position[i]
-                        max_step = 1.0
-                        step = np.clip(tgt - curr, -max_step, max_step)
-                        deg = curr + step
-                        # ma_deque[i].append(deg)
-                        deg = float(np.mean(ma_deque[i])) if len(ma_deque[i]) > 0 else deg
-                        self.base_command.actuators[i].position = deg
-
                     # === 그리퍼 명령도 같은 프레임에 실어서 보냄 (0~100%) ===
                     self.motorcmd.position = self.target_gripper
                     self.motorcmd.velocity = self.grip_vel
                     self.motorcmd.force    = self.grip_force
+                    
+                    q  = np.array(self.q_deg, dtype=float) * DEG2RAD
+                    dq = np.array(self.dq_deg, dtype=float) * DEG2RAD
+                    q_des = np.array(self.q_des_deg, dtype=float) * DEG2RAD
+                    dq_des = np.zeros_like(dq)  # desire zero velocity
+
+                # 3) Desired joint acceleration from PD in velocity form
+                ddq_des = self.Kp*(q_des - q) + self.Kd*(dq_des - dq)
+
+                # 4) RNEA to get full torque (gravity + coriolis + inertia)
+                tau = pin.rnea(self.pin_model, self.pin_data, q, dq, ddq_des)
+
+                # 5) Soft-limit torques
+                tau = np.clip(tau, -self.torque_limit, self.torque_limit)
+
+                # Convert to currents (A) and clamp
+                I_cmd = self._tau_to_current(tau)
+                # print(I_cmd)
+                for i in range(self.ndof):
+                    self.base_command.actuators[i].position = self.base_feedback.actuators[i].position
+                    # self.base_command.actuators[i].current_motor = float(I_cmd[i])
+                    self.base_command.actuators[i].current_motor = 0.0
 
                 # Incrementing identifier ensure actuators can reject out of time frames
                 self.base_command.frame_id += 1
                 if self.base_command.frame_id > 65535:
                     self.base_command.frame_id = 0
-                for i in range(self.actuator_count):
+                for i in range(self.ndof):
                     self.base_command.actuators[i].command_id = self.base_command.frame_id
 
                 # interconnect/그리퍼 command_id도 같이 갱신
@@ -299,9 +372,12 @@ class TorqueExample:
                 try:
                     self.base_feedback = self.base_cyclic.Refresh(self.base_command, 0, self.sendOption)
                     with self.lock:
-                        self.current_position = [self.base_feedback.actuators[i].position
-                                                for i in range(self.actuator_count)]
-                        
+                        self.q_deg = [self.base_feedback.actuators[i].position
+                                      for i in range(self.ndof)]
+                        self.dq_deg = [self.base_feedback.actuators[i].velocity
+                                       for i in range(self.ndof)]
+                        self.q_des_deg = self.q_deg.copy()  # avoid large jumps
+
                     try:
                         self.current_gripper = self.base_feedback.interconnect.gripper_feedback.motor[0].position
                     except Exception:
@@ -316,8 +392,8 @@ class TorqueExample:
                 t_stats = t_now
                 stats_count = stats_count + 1
                 
-                print("current position: ", self.current_position, end="\r")
-                print("target position: ", self.target_position, end="\r")
+                print("current position: ", self.q_deg, end="\r")
+                print("target position: ", self.q_des_deg, end="\r")
                 cyclic_count = 0
                 failed_cyclic_count = 0
                 sys.stdout.flush()
@@ -376,7 +452,7 @@ def main():
     with utilities.DeviceConnection.createTcpConnection(args) as router:
         with utilities.DeviceConnection.createUdpConnection(args) as router_real_time:
 
-            example = TorqueExample(router, router_real_time)
+            example = CurrentControlExample(router, router_real_time)
 
             # ROS2 bridge 노드 생성
             ros2_node = Ros2Bridge(example)

@@ -7,10 +7,10 @@ import threading
 import numpy as np
 
 # --- 시스템 경로 설정 ---
-sys.path.append(os.path.dirname(__file__))
-sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
-module_directory = os.path.expanduser("~/dynamixel_sdk")
-sys.path.append(module_directory)
+# sys.path.append(os.path.dirname(__file__))
+# sys.path.append(os.path.dirname(os.path.abspath(os.path.dirname(__file__))))
+# module_directory = os.path.expanduser("~/dynamixel_sdk")
+# sys.path.append(module_directory)
 
 # --- 다이나믹셀 SDK 및 Kinova API 임포트 ---
 from dynamixel_sdk import *

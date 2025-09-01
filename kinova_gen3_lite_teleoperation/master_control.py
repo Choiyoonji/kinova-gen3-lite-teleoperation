@@ -18,7 +18,7 @@ sys.path.append(module_directory)
 # --- Dynamixel SDK ---
 from dynamixel_sdk import *  # noqa
 
-XL_DXL_JOINT = [0,1,2,3,4,5]
+XL_DXL_JOINT = [0,1,2,3,4,5,6]
 # =========================
 # 하드웨어/프로토콜 설정값
 # =========================
@@ -39,10 +39,10 @@ XL_TORQUE_DISABLE = 0
 # 보정/스케일링 설정값
 # =========================
 # 예시: 홈 포즈 raw 값 (사용자가 이미 갖고 있는 값으로 교체하세요)
-MASTER_HOME_POSITION_RAW = [268, 2072, 3032, 999, 989, 3191]  # 6개만 사용
+MASTER_HOME_POSITION_RAW = [268, 2072, 3032, 999, 989, 3191, 1781]  # 7개 사용
 MASTER_JOINT_ZERO_RAW = np.array(MASTER_HOME_POSITION_RAW[:len(XL_DXL_JOINT)])
 MASTER_RAW_PER_DEGREE = 4096.0 / 360.0
-JOINT_DIRECTION_MAPPING = np.array([1, 1, 1, 1, 1, 1], dtype=float)  # 부호/감도 조정 시 수정
+JOINT_DIRECTION_MAPPING = np.array([1, 1, 1, 1, 1, 1, 1], dtype=float)  # 부호/감도 조정 시 수정
 
 def wrap_to_180_array(deg_arr: np.ndarray) -> np.ndarray:
     return (deg_arr + 180.0) % 360.0 - 180.0
@@ -51,7 +51,7 @@ def wrap_to_180_array(deg_arr: np.ndarray) -> np.ndarray:
 # Dynamixel Bulk Reader
 # =========================
 class DynamixelReader:
-    """마스터 다이나믹셀 팔에서 6개 관절 raw 위치를 BulkRead로 읽는 간단 클래스."""
+    """마스터 다이나믹셀 팔에서 6개 관절+그리퍼 raw 위치를 BulkRead로 읽는 간단 클래스."""
     def __init__(self, device=DEVICENAME, baudrate=BAUDRATE):
         self.port_handler = PortHandler(device)
         self.packet_handler = PacketHandler(PROTOCOL_VERSION)
@@ -156,11 +156,12 @@ class MasterDxlBridge(Node):
         raw_arr[wrap_mask] -= 2**32
 
         # 0점 보정 + 스케일링(+ 방향맵)
-        s_di = np.array([180, -180, 180, 0, 180, 0])
+        s_di = np.array([180, -180, 180, 0, 180, 0, -160])
         delta_raw = raw_arr
         deg = (delta_raw / MASTER_RAW_PER_DEGREE) * JOINT_DIRECTION_MAPPING
         # [-180,180) 래핑
         deg = wrap_to_180_array(deg+s_di)
+        deg[-1] = np.clip(deg[-1]*5, 0, 100)  # 그리퍼는 0~100%로 제한
 
         # 이동평균(옵션)
         # for i in range(len(deg)):
