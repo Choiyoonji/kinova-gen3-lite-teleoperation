@@ -32,7 +32,7 @@ class Ros2Bridge(Node):
             10
         )
 
-        self.ma_window = 30
+        self.ma_window = 20
         self.ma_buffers = [deque(maxlen=self.ma_window) 
                            for _ in range(len(self.torque_example.target_position))]
 
@@ -44,6 +44,9 @@ class Ros2Bridge(Node):
         self.timer = self.create_timer(timer_period, self.publish_current_position)
 
     def target_callback(self, msg: Float32MultiArray): # 10hz
+        if self.torque_example.cyclic_running is False:
+            self.get_logger().warning("Cyclic not running, cannot update target.")
+            return
         if len(msg.data) != 7:
             self.get_logger().warning(
                 f"Received target length {len(msg.data)} != actuator count "
@@ -67,6 +70,9 @@ class Ros2Bridge(Node):
 
     def publish_current_position(self):
         """TorqueExample에서 current_position 가져와 ROS2로 publish"""
+        if self.torque_example.cyclic_running is False:
+            self.get_logger().warning("Cyclic not running, cannot update target.")
+            return
         msg = Float32MultiArray()
         processed_data = []
         with self.torque_example.lock:
@@ -80,6 +86,55 @@ class Ros2Bridge(Node):
         msg.data = processed_data
         self.pub.publish(msg)
 
+class FilterAndRateLimiter:
+    """
+    입력 목표에 EMA 필터를 적용한 후,
+    실시간 속도 및 가속도 제한을 수행합니다.
+    """
+    def __init__(self, max_velocity, max_acceleration, dt=0.001, alpha=0.1):
+        # 1. 필터 관련 파라미터 및 상태 변수
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError("alpha 값은 0보다 크고 1보다 작거나 같아야 합니다.")
+        self.alpha = alpha  # 필터링 강도 (작을수록 부드러움)
+        self.smoothed_target = 0.0 # 필터링된 목표 위치를 저장
+
+        # 2. 속도/가속도 제한 관련 파라미터 및 상태 변수
+        self.max_v = abs(max_velocity)
+        self.max_a = abs(max_acceleration)
+        self.dt = dt
+        self.prev_velocity = 0.0
+
+    def initialize_target(self, position):
+        """필터의 초기 위치를 현재 로봇 위치로 설정하여 시작 시 튀는 현상 방지"""
+        self.smoothed_target = position
+
+    def compute(self, current_pos, final_target):
+        """
+        필터링과 속도/가속도 제한을 모두 적용하여
+        다음 스텝의 목표 위치를 계산합니다.
+        """
+        # --- 단계 1: EMA 필터로 목표 위치를 부드럽게 만들기 ---
+        self.smoothed_target = self.alpha * final_target + (1.0 - self.alpha) * self.smoothed_target
+
+        # --- 단계 2: 부드러워진 목표(smoothed_target)를 사용하여 속도/가속도 제한 적용 ---
+        error = self.smoothed_target - current_pos
+        desired_velocity = error / self.dt
+
+        v_limited_by_vel = np.clip(desired_velocity, -self.max_v, self.max_v)
+
+        max_delta_v = self.max_a * self.dt
+        v_limited_by_accel = np.clip(
+            v_limited_by_vel,
+            self.prev_velocity - max_delta_v,
+            self.prev_velocity + max_delta_v
+        )
+        
+        final_limited_velocity = v_limited_by_accel
+        next_target_pos = current_pos + np.clip(final_limited_velocity * self.dt, -2.0, 2.0)
+
+        self.prev_velocity = final_limited_velocity
+        
+        return next_target_pos
 
 class TorqueExample:
     def __init__(self, router, router_real_time):
@@ -132,8 +187,12 @@ class TorqueExample:
 
         self.current_gripper = 0.0
         self.target_gripper = 0.0
-        self.grip_vel    = 30.0    # 0~100 (%)
+        self.grip_vel    = 20.0    # 0~100 (%)
         self.grip_force  = 50.0    # 0~100 (%)
+
+        self.limiter = []
+        for i in range(self.actuator_count):
+            self.limiter.append(FilterAndRateLimiter(max_velocity=900.0, max_acceleration=18000.0, dt=0.001, alpha=0.1))
 
     # Create closure to set an event after an END or an ABORT
     def check_for_end_or_abort(self, e):
@@ -213,6 +272,7 @@ class TorqueExample:
                 self.base_command.actuators[x].position = self.base_feedback.actuators[x].position
                 self.current_position[x] = self.base_feedback.actuators[x].position
                 self.target_position[x] = self.base_feedback.actuators[x].position
+                self.limiter[x].initialize_target(self.base_feedback.actuators[x].position)
 
             # Set arm in LOW_LEVEL_SERVOING
             base_servo_mode = Base_pb2.ServoingModeInformation()
@@ -244,7 +304,7 @@ class TorqueExample:
 
     def RunCyclic(self, t_sample, print_stats):
         self.cyclic_running = True
-        print("Run Cyclic")
+        print("Run Cyclic!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!1")
         sys.stdout.flush()
         cyclic_count = 0  # Counts refresh
         stats_count = 0  # Counts stats prints
@@ -254,11 +314,10 @@ class TorqueExample:
         t_cyclic = t_now  # cyclic time
         t_stats = t_now  # print  time
         t_init = t_now  # init   time
-        ma_size = 50  # moving average size
+        ma_size = 300  # moving average size
         ma_deque = [deque(maxlen=ma_size) for _ in range(self.actuator_count)]
 
         print("Running torque control example for {} seconds".format(self.cyclic_t_end))
-
         while not self.kill_the_thread:
             t_now = time.time()
 
@@ -272,12 +331,14 @@ class TorqueExample:
                     for i in range(self.actuator_count):
                         curr = (self.current_position[i] + 180.0) % 360.0 - 180.0
                         tgt  = self.target_position[i]
-                        max_step = 1.0
-                        step = np.clip(tgt - curr, -max_step, max_step)
-                        deg = curr + step
-                        # ma_deque[i].append(deg)
-                        deg = float(np.mean(ma_deque[i])) if len(ma_deque[i]) > 0 else deg
-                        self.base_command.actuators[i].position = deg
+                        # max_step = 1.0
+                        # step = np.clip(tgt - curr, -max_step, max_step)
+                        # deg = curr + step
+                        # # ma_deque[i].append(deg)
+                        # deg = float(np.mean(ma_deque[i])) if len(ma_deque[i]) > 0 else deg
+                        # self.base_command.actuators[i].position = deg
+                        limited_target = self.limiter[i].compute(curr, tgt)
+                        self.base_command.actuators[i].position = limited_target
 
                     # === 그리퍼 명령도 같은 프레임에 실어서 보냄 (0~100%) ===
                     self.motorcmd.position = self.target_gripper
@@ -311,13 +372,13 @@ class TorqueExample:
                     failed_cyclic_count = failed_cyclic_count + 1
                 cyclic_count = cyclic_count + 1
 
+                # print("current position: ", self.current_position, end="\r")
+                # print("target position: ", self.target_position, end="\r")
             # Stats Print
             if print_stats and ((t_now - t_stats) > 1):
                 t_stats = t_now
                 stats_count = stats_count + 1
                 
-                print("current position: ", self.current_position, end="\r")
-                print("target position: ", self.target_position, end="\r")
                 cyclic_count = 0
                 failed_cyclic_count = 0
                 sys.stdout.flush()

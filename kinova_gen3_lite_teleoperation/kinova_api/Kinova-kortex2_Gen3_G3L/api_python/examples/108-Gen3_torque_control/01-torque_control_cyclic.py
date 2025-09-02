@@ -82,17 +82,12 @@ class TorqueExample:
         device_handles = device_manager.ReadAllDevices()
         self.actuator_count = self.base.GetActuatorCount().count
 
-        # Only actuators are relevant for this example
-        # for handle in device_handles.device_handle:
-        #     if handle.device_type == Common_pb2.BIG_ACTUATOR or handle.device_type == Common_pb2.SMALL_ACTUATOR:
-        #         self.base_command.actuators.add()
-        #         self.base_feedback.actuators.add()
-
         self.base_command.ClearField("actuators")
         self.base_feedback.ClearField("actuators")
         for _ in range(self.actuator_count):
             self.base_command.actuators.add()
             self.base_feedback.actuators.add()
+
 
         # Change send option to reduce max timeout at 3ms
         self.sendOption = RouterClientSendOptions()
@@ -136,9 +131,9 @@ class TorqueExample:
         action_list = self.base.ReadAllActions(action_type)
         action_handle = None
         for action in action_list.action_list:
-            if action.name == "kinova_home":
+            if action.name == "Home":
                 action_handle = action.handle
-        print("action_handle: ", action_handle)
+
         if action_handle == None:
             print("Can't reach safe position. Exiting")
             return False
@@ -198,7 +193,7 @@ class TorqueExample:
 
             # Set first actuator in torque mode now that the command is equal to measure
             control_mode_message = ActuatorConfig_pb2.ControlModeInformation()
-            control_mode_message.control_mode = ActuatorConfig_pb2.ControlMode.Value('TORQUE')
+            control_mode_message.control_mode = ActuatorConfig_pb2.ControlMode.Value('CURRENT')
             device_id = 1  # first actuator as id = 1
 
             self.SendCallWithRetry(self.actuator_config.SetControlMode, 3, control_mode_message, device_id)
@@ -223,10 +218,10 @@ class TorqueExample:
         failed_cyclic_count = 0  # Count communication timeouts
 
         # Initial delta between first and last actuator
-        init_delta_position = self.base_feedback.actuators[0].position - self.base_feedback.actuators[self.actuator_count - 5].position
+        init_delta_position = self.base_feedback.actuators[0].position - self.base_feedback.actuators[self.actuator_count - 1].position
 
         # Initial first and last actuator torques; avoids unexpected movement due to torque offsets
-        init_last_torque = self.base_feedback.actuators[self.actuator_count - 5].torque
+        init_last_torque = self.base_feedback.actuators[self.actuator_count - 1].torque
         init_first_torque = -self.base_feedback.actuators[0].torque  # Torque measure is reversed compared to actuator direction
 
         t_now = time.time()
@@ -238,7 +233,6 @@ class TorqueExample:
 
         while not self.kill_the_thread:
             t_now = time.time()
-            print("Current time: ", t_now - t_cyclic, "s", end="\r")
 
             # Cyclic Refresh
             if (t_now - t_cyclic) >= t_sample:
@@ -251,10 +245,10 @@ class TorqueExample:
 
                 # First actuator torque command is set to last actuator torque measure times an amplification
                 self.base_command.actuators[0].torque_joint = init_first_torque + \
-                    self.torque_amplification * (self.base_feedback.actuators[self.actuator_count - 5].torque - init_last_torque)
+                    self.torque_amplification * (self.base_feedback.actuators[self.actuator_count - 1].torque - init_last_torque)
 
                 # First actuator position is sent as a command to last actuator
-                self.base_command.actuators[self.actuator_count - 5].position = self.base_feedback.actuators[0].position - init_delta_position
+                self.base_command.actuators[self.actuator_count - 1].position = self.base_feedback.actuators[0].position - init_delta_position
 
                 # Incrementing identifier ensure actuators can reject out of time frames
                 self.base_command.frame_id += 1

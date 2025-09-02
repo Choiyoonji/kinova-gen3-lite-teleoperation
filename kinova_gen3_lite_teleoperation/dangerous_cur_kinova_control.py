@@ -262,7 +262,7 @@ class CurrentControlExample:
                 self.q_deg[x] = self.base_feedback.actuators[x].position
                 self.q_des_deg[x] = self.base_feedback.actuators[x].position
                 self.dq_deg[x] = self.base_feedback.actuators[x].velocity
-                self.base_command.actuators[x].torque_joint = self.base_feedback.actuators[x].torque
+                self.base_command.actuators[x].current_motor = self.base_feedback.actuators[x].current_motor
 
             # Set arm in LOW_LEVEL_SERVOING
             base_servo_mode = Base_pb2.ServoingModeInformation()
@@ -284,6 +284,7 @@ class CurrentControlExample:
             for i in range(self.ndof):
                 control_mode_message = ActuatorConfig_pb2.ControlModeInformation()
                 control_mode_message.control_mode = ActuatorConfig_pb2.ControlMode.Value('CURRENT')
+                print(i)
                 device_id = i + 1
                 self.SendCallWithRetry(self.actuator_config.SetControlMode, 3, control_mode_message, device_id)
 
@@ -355,7 +356,9 @@ class CurrentControlExample:
                 for i in range(self.ndof):
                     self.base_command.actuators[i].position = self.base_feedback.actuators[i].position
                     # self.base_command.actuators[i].current_motor = float(I_cmd[i])
+                    # self.base_command.actuators[i].current_motor = self.base_feedback.actuators[i].current_motor
                     self.base_command.actuators[i].current_motor = 0.0
+
 
                 # Incrementing identifier ensure actuators can reject out of time frames
                 self.base_command.frame_id += 1
